@@ -76,7 +76,7 @@ features:add(nn.SpatialBatchNormalization(512))
 features:add(nn.LeakyReLU(0.1,true))
 features:add(nn.SpatialMaxPooling(3,3,2,2))
 -- spatial_size = 2
-features:add(nn.View(512*4))
+features:add(nn.View(512*4):setNumInputDims(3))
 
 features:cuda()
 
