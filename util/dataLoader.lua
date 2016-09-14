@@ -11,7 +11,7 @@ local dataLoader = torch.class('dataLoader')
 function dataLoader:__init(dir,labelf)
   -- shuffle seed
   self.gen = torch.Generator()
-  self.batch_size = 8
+  self.batch_size = 128
   torch.manualSeed(self.gen, 1337)
 
   -- input image dimensions
@@ -31,20 +31,21 @@ function dataLoader:__init(dir,labelf)
   self:genFileList()
 
   -- super sample underrepresented labels in datalist
-  self:balanceLabels()
+  -- alpha input is range [0,1] to weight balancing
+  self:balanceLabels(0.5)
 
   assert(#self.datalist >= 1,'no images found in folder')
 
   self.shuffle = torch.randperm(self.gen,#self.datalist)
   self.shuffle_state = 1
 
-  self.numBatches = self.batch_size % self.shuffle:size(1)
+  self.numBatches = torch.floor(self.shuffle:size(1) / self.batch_size)
 
   collectgarbage()
 
 end
 
-function dataLoader:balanceLabels()
+function dataLoader:balanceLabels(alpha)
   local labelCounts = {}
   local labelSplits = {}
   for n=1,5 do
@@ -63,7 +64,7 @@ function dataLoader:balanceLabels()
   -- for each label, if below max represented:
   -- add a random sample from label class to bottom of datalist
   for label,count in pairs(labelCounts) do
-    for n=1,(maxRep - count) do
+    for n=1,torch.ceil((maxRep - count)*alpha) do
       local randSel = torch.ceil(torch.rand(1)*count)[1]
       local randPick = labelSplits[label][randSel]
       table.insert(self.datalist,randPick)

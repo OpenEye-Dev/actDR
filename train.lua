@@ -10,11 +10,15 @@ require 'xlua'
 
 local Threads = require 'threads'
 
+require 'TrainPlotter'
+local plotter = TrainPlotter.new('out.json')
+
 -- options to handle:
--- pool size : 8
+-- pool size
 -- input directory
 -- label file path
 -- learning rate info
+-- validation, testing...relaxing oversampling
 
 local net = require 'kaggle-diabetic-model.lua'
 
@@ -38,7 +42,7 @@ local indir = '/mas/u/tswedish/kaggle_data/train_medium_png/'
 local labelf = '/mas/u/tswedish/kaggle_data/totalTrainLabel.csv'
 
 local optimState = {
-    learningRate = 0.0001,
+    learningRate = 0.001,
     learningRateDecay = 0.0,
     momentum = 0.1,
     dampening = 0.0,
@@ -47,6 +51,7 @@ local optimState = {
 
 local paramTrainLoader = dataLoader(indir,labelf)
 local numBatches = paramTrainLoader.numBatches
+print('Num training examples: '..#paramTrainLoader.datalist)
 
 -- create a data loader pool
 local pool = Threads(
@@ -62,7 +67,20 @@ local pool = Threads(
   end
 )
 
+local function getConfusionMatrix(outputs,labels)
+  local m
+  local cM = torch.zeros(5,5)
+  _,m = torch.max(outputs,2)
+  -- add to the matrix accumulator for each
+  for n=1,labels:size()[1] do
+    cM[labels[n]][m[n][1]] = cM[labels[n]][m[n][1]]+1
+  end
+  return cM
+end
+
 local loss_epoch,batchNumber
+
+local itnum = 0
 
 -- GPU inputs (preallocate)
 local inputs = torch.CudaTensor()
@@ -70,7 +88,7 @@ local labels = torch.CudaTensor()
 
 local parameters, gradParameters = model:getParameters()
 
-function trainBatch(inputsCPU, labelsCPU)
+local function trainBatch(inputsCPU, labelsCPU)
    cutorch.synchronize()
    collectgarbage()
 
@@ -92,14 +110,15 @@ function trainBatch(inputsCPU, labelsCPU)
 
    -- if first batch, let's see how we're doing?
    if batchNumber == 1 then
-     print(labels)
-     local m
-     _,m = torch.max(outputs,2)
-     print(m)
+     -- generate confusion matrix
+     print('-')
+     print(getConfusionMatrix(outputs,labels))
    end
    cutorch.synchronize()
    batchNumber = batchNumber + 1
+   itnum = itnum + 1
    loss_epoch = loss_epoch + err
+   plotter:add('Loss','Train',itnum,err)
    xlua.progress(batchNumber, numBatches)
 
 end
@@ -141,7 +160,17 @@ end -- of train()
 -------------------------------------------------------------------------------------------
 
 local tot_e = 100
-for e=1,100 do
+for e=1,tot_e do
   local avg_loss = train(e)
   print('finished epoch '..e..' of '..tot_e..' loss: '..avg_loss)
+  -- generate confusion matrix on the validation set?
+  if e % 5 == 0 then
+    print('saving model...')
+    torch.save('model_'..e..'_kaggle_test.t7',model)
+    torch.save('optimstate_'..e..'kaggle_test.t7',optimState)
+  end
 end
+
+print('saving model...')
+torch.save('model_kaggle_test.t7',model)
+torch.save('optimstate_kaggle_test.t7',optimState)
