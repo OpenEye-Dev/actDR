@@ -1,7 +1,7 @@
 require 'nn'
 require 'image'
 
-local convert_cpu = true
+local convert_cpu = false
 
 -- if only running CPU models, no need to load CUDA
 local gpu = false
@@ -10,7 +10,7 @@ if gpu then
   require 'cudnn'
 end
 
-local model = torch.load('model_cpu.t7')
+local model = torch.load('test_cc_cpu_state_cleared.t7')
 model:evaluate()
 print('model loaded:')
 
@@ -35,7 +35,7 @@ if convert_cpu and not is_cpu_model then
   is_cpu_model = true
 end
 -- 999{4,5,7}, 999, 9 (L/R)
-local tmp_input = image.load('../kaggle_data/test_medium_png/10005_right.png')
+local tmp_input = image.load('../kaggle_data/test_medium_png/10066_right.png')
 
 local inputCPU
 if is_cpu_model then
@@ -62,5 +62,7 @@ print('image loaded, memory allocated, predicting...')
 
 local output = model:forward(input)
 
-print(model.outputs[1])
-print(output[1])
+if not gpu then
+  --print(model.outputs[1])
+end
+print(torch.exp(output[1])/torch.sum(torch.exp(output[1])))

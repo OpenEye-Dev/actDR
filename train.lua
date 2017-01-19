@@ -20,37 +20,56 @@ local plotter = TrainPlotter.new('out.json')
 -- learning rate info
 -- validation, testing...relaxing oversampling
 
-local net = require 'kaggle-diabetic-model.lua'
+cudnn.fastest = true
+cudnn.benchmark = true
 
-net:cuda()
+local model
+local load_model = false
 
--- parallelize training over two gpus
-local model = nn.DataParallelTable(1):threads(function()
-  require 'cudnn'
-end)
-model:add(net, {1,2})
+if not load_model then
+  local net = require 'kaggle-diabetic-model-regression.lua'
 
--- use cudnn modules where possible
-cudnn.convert(model,cudnn)
+  net:cuda()
 
-local criterion = nn.ClassNLLCriterion()
+  -- parallelize training over two gpus
+  model = nn.DataParallelTable(1):threads(function()
+    require 'cudnn'
+  end)
+  model:add(net, {1,2})
+
+  -- use cudnn modules where possible
+  cudnn.convert(model,cudnn)
+else
+  print('loading model')
+  model = torch.load('model_5_10ratio_092116.t7')
+end
+
+-- Setup for regression
+local criterion = nn.MSECriterion()
+-- for class prob
+--local criterion = nn.ClassNLLCriterion()
 criterion:cuda()
 
 require 'util.dataLoader'
 
-local indir = '/mas/u/tswedish/kaggle_data/train_medium_png/'
+local indir = '/mas/u/tswedish/kaggle_data/test_medium_png/'
+local indirT = '/mas/u/tswedish/kaggle_data/train_medium_png/'
 local labelf = '/mas/u/tswedish/kaggle_data/totalTrainLabel.csv'
 
 local optimState = {
     learningRate = 0.001,
-    learningRateDecay = 0.0,
-    momentum = 0.1,
-    dampening = 0.0,
-    weightDecay = 0.00001
+    -- with batch size of 128...150 epoch is about 75k iterations
+    -- to match kaggle solution: 0.003/(1+75000*0.0001) = 0.0003
+    learningRateDecay = 0.0001,
+    momentum = 0.9,
+    weightDecay = 0.0005
 }
 
-local paramTrainLoader = dataLoader(indir,labelf)
-local numBatches = paramTrainLoader.numBatches
+local paramTrainLoader = dataLoader(indir,labelf,1)
+local paramTestLoader = dataLoader(indirT,labelf,1)
+local numBatchesTrain = paramTrainLoader.numBatches
+local numBatchesTest = paramTestLoader.numBatches
+local numBatches
 print('Num training examples: '..#paramTrainLoader.datalist)
 
 -- create a data loader pool
@@ -61,7 +80,8 @@ local pool = Threads(
     require 'util.dataLoader'
   end,
   function(idx)
-    dL = dataLoader(indir,labelf)
+    dL = dataLoader(indir,labelf,1)
+    dLT = dataLoader(indirT,labelf,1)
     tid = idx
     print('starting thread with id '..tostring(tid))
   end
@@ -70,10 +90,19 @@ local pool = Threads(
 local function getConfusionMatrix(outputs,labels)
   local m
   local cM = torch.zeros(5,5)
-  _,m = torch.max(outputs,2)
+  -- if one hot, else is regression
+  if outputs:size(2) > 1 then
+    _,m = torch.max(outputs,2)
+  else
+    m = torch.round(outputs):view(-1,1)
+  end
   -- add to the matrix accumulator for each
   for n=1,labels:size()[1] do
-    cM[labels[n]][m[n][1]] = cM[labels[n]][m[n][1]]+1
+    local o = m[n][1]
+    -- clamp indexing to prevent indexing errors
+    if o < 1 then o = 1 end
+    if o > 5 then o = 5 end
+    cM[labels[n]][o] = cM[labels[n]][o]+1
   end
   return cM
 end
@@ -88,6 +117,33 @@ local labels = torch.CudaTensor()
 
 local parameters, gradParameters = model:getParameters()
 
+local function testBatch(inputsCPU, labelsCPU)
+   cutorch.synchronize()
+   collectgarbage()
+
+   -- transfer over to GPU
+   inputs:resize(inputsCPU:size()):copy(inputsCPU)
+   labels:resize(labelsCPU:size()):copy(labelsCPU)
+
+   local err, outputs
+   outputs = model:forward(inputs)
+   err = criterion:forward(outputs, labels)
+
+   -- if end of batch, let's see how we're doing?
+   if batchNumber == numBatches-1 then
+     -- generate confusion matrix
+     print('-')
+     print(getConfusionMatrix(outputs,labels))
+     print('Err: '..err)
+   end
+
+   cutorch.synchronize()
+   batchNumber = batchNumber + 1
+   loss_epoch = loss_epoch + err
+   xlua.progress(batchNumber, numBatches)
+
+end
+
 local function trainBatch(inputsCPU, labelsCPU)
    cutorch.synchronize()
    collectgarbage()
@@ -97,7 +153,7 @@ local function trainBatch(inputsCPU, labelsCPU)
    labels:resize(labelsCPU:size()):copy(labelsCPU)
 
    local err, outputs
-   feval = function(x)
+   local feval = function(x)
       model:zeroGradParameters()
       outputs = model:forward(inputs)
       err = criterion:forward(outputs, labels)
@@ -108,30 +164,67 @@ local function trainBatch(inputsCPU, labelsCPU)
    optim.sgd(feval, parameters, optimState)
 
 
-   -- if first batch, let's see how we're doing?
-   if batchNumber == 1 then
+   -- if end of batch, let's see how we're doing?
+   if batchNumber == 1 or batchNumber == numBatches-1 then
      -- generate confusion matrix
      print('-')
      print(getConfusionMatrix(outputs,labels))
+     print('Err: '..err)
+     torch.save('model_ab_'..'_kaggle_test.t7',model)
    end
    cutorch.synchronize()
    batchNumber = batchNumber + 1
    itnum = itnum + 1
    loss_epoch = loss_epoch + err
-   plotter:add('Loss','Train',itnum,err)
+   if (itnum == 1) or (itnum % 25 == 0) then
+     -- protected call becasue of weird file writing error
+     -- don't print super high errors (to track delta loss on graph easier...)
+     if err < 3 then
+       _,emsg = pcall(function() plotter:add('Loss','Train',itnum,err) end)
+       if emsg then print(emsg) end
+     end
+   end
    xlua.progress(batchNumber, numBatches)
 
 end
 
-function train(epoch)
+local function test()
   loss_epoch = 0
   batchNumber = 0
+  numBatches = 50 --numBatchesTest
+  model:evaluate()
   cutorch.synchronize()
 
-  -- set the dropouts to training mode
-  model:training()
+  for i=1,50 do
+    -- queue jobs to data-workers
+    pool:addjob(
+       -- the job callback (runs in data-worker thread)
+       function()
+          local inputs, labels = dLT:getBatch(i,1)
+          return inputs, labels
+       end,
+       -- the end callback (runs in the main thread)
+       testBatch
+    )
+  end
 
-  for i=1,numBatches do
+  pool:synchronize()
+  cutorch.synchronize()
+  -- save model
+  collectgarbage()
+
+  local avg_loss = loss_epoch/numBatches
+  return avg_loss
+end
+
+local function train(epoch)
+  loss_epoch = 0
+  batchNumber = 0
+  numBatches = numBatchesTrain
+  model:training()
+  cutorch.synchronize()
+
+  for i=1,numBatchesTrain do
     -- queue jobs to data-workers
     pool:addjob(
        -- the job callback (runs in data-worker thread)
@@ -159,15 +252,23 @@ function train(epoch)
 end -- of train()
 -------------------------------------------------------------------------------------------
 
+-- set the dropouts to training mode
+
 local tot_e = 100
 for e=1,tot_e do
   local avg_loss = train(e)
   print('finished epoch '..e..' of '..tot_e..' loss: '..avg_loss)
+  local test_avg_loss = test()
+  print('finished test epoch '..e..' of '..tot_e..' loss: '..test_avg_loss)
+
+  --protected call because of weird file writing error
+  _,emsg = pcall(function() plotter:add('Loss','Test',itnum,test_avg_loss) end)
+  if emsg then print(emsg) end
   -- generate confusion matrix on the validation set?
   if e % 5 == 0 then
     print('saving model...')
-    torch.save('model_'..e..'_kaggle_test.t7',model)
-    torch.save('optimstate_'..e..'kaggle_test.t7',optimState)
+    torch.save('model_d_'..e..'_kaggle_test.t7',model)
+    torch.save('optimstate_d_'..e..'kaggle_test.t7',optimState)
   end
 end
 
