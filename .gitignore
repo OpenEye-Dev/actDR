@@ -1,0 +1,6 @@
+thirdparty/
+output/
+data/
+.watchmanconfig
+.DS_Store
+*.json

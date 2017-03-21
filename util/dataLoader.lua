@@ -8,16 +8,20 @@ require 'io'
 -- create an class that reads in data and returns an indexed batch
 local dataLoader = torch.class('dataLoader')
 
-function dataLoader:__init(dir,labelf,rebalance)
+function dataLoader:__init(dir,labelf,rebalance,img_size,batch_size)
   -- shuffle seed
   self.gen = torch.Generator()
-  self.batch_size = 128
+  self.batch_size = batch_size or 128
   torch.manualSeed(self.gen, 1337)
 
   -- input image dimensions
-  self.w = 512
-  self.h = 512
+  self.w = img_size or 128
+  self.h = img_size or 128
+  self.cache_size = cache_size or 5000
   self.chan = 3
+
+  self.local_cache = {}
+  self.cache_count = 0
 
   -- the directory all the data is in (assumes pre-split)
   self.dataDir = dir
@@ -41,8 +45,8 @@ function dataLoader:__init(dir,labelf,rebalance)
 
   self.shuffle = torch.randperm(self.gen,#self.datalist)
   self.shuffle_state = 1
-
-  self.numBatches = torch.floor(self.shuffle:size(1) / self.batch_size)
+  -- NOTE: need to verify this is accurate... solving off by one error
+  self.numBatches = torch.floor((self.shuffle:size(1) / self.batch_size) - 1)
 
   collectgarbage()
 
@@ -102,6 +106,23 @@ function dataLoader:getLabel(fname)
   return label
 end
 
+function dataLoader:addToCache(fname,img)
+  self.cache_count = self.cache_count + 1
+  if self.cache_count > self.cache_size then
+    for v in pairs(self.local_cache) do
+      self.local_cache[v] = nil
+      break -- only set first entry to nil
+    end
+    self.cache_count = self.cache_count - 1
+  end
+  -- finally add the loaded image
+  self.local_cache[fname] = img
+end
+
+-- get batch by num based on batch_size...
+-- also get shuffled list (select from cache if already calculated)
+-- NOTE: verify cached shuffled lists are deterministic from seed
+-- (for multi-threaded loading)
 function dataLoader:getBatchList(num, shuff)
   if shuff == nil then
     shuff = self.shuffle_state
@@ -112,6 +133,8 @@ function dataLoader:getBatchList(num, shuff)
     self.shuffle = torch.randperm(self.gen,#self.datalist)
     self.shuffle_state = self.shuffle_state + 1
   end
+  -- convert batch number to index in full epoch
+  num = ((num-1)*self.batch_size)+1
   assert (num+self.batch_size-1 < self.shuffle:size(1),
     'batch index out of range')
 
@@ -134,12 +157,13 @@ function dataLoader:generateTransformer()
   -- to accomodate zooms 1/1.15 to 1.15
   -- also want to have some random crop jitter of 20 pixels
   -- zoom transform
-  transforms[1] = T.RandomScale(532,604)
+  img_size = self.w
+  transforms[1] = T.RandomScale(img_size,img_size*1.15)
   -- rotate (still centered around circle)
   transforms[2] = T.Rotation(360)
-  transforms[3] = T.CenterCrop(532)
+  transforms[3] = T.CenterCrop(img_size)--*(1.0/1.15))
 
-  transforms[4] = T.CenterCrop(512)
+  transforms[4] = T.CenterCrop(img_size)
 
   -- color jitter
   local jitteropt = {}
@@ -176,8 +200,21 @@ function dataLoader:getBatch(num,shuff)
   for i,fname in pairs(batch_list) do
     -- get the label
     labels[i] = self:getLabel(fname)
+
+    -- we need to load the image if we don't already have it
+    local tmp_input
+    -- require global cache so data duplication across threads is not a prob..
+    --[[  if self.local_cache[fname] == nil then
+      tmp_input = image.load(self.dataDir..'/'..fname..'.png')
+      -- now let's add this to the cache
+      self:addToCache(fname,tmp_input)
+    else
+      tmp_input = self.local_cache[fname]
+    end]]
+    tmp_input = image.load(self.dataDir..'/'..fname..'.png')
     -- load in the image
-    local tmp_input = image.load(self.dataDir..'/'..fname..'.png')
+    -- we want to add a local cache with fixed number of images
+
     -- transform it to fit, center crop, rotate (, then color, etc)
     -- find the smallest side
     input[i] = self.transformer(tmp_input)
