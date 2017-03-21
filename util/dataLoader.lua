@@ -8,10 +8,10 @@ require 'io'
 -- create an class that reads in data and returns an indexed batch
 local dataLoader = torch.class('dataLoader')
 
-function dataLoader:__init(dir,labelf)
+function dataLoader:__init(dir,labelf,rebalance)
   -- shuffle seed
   self.gen = torch.Generator()
-  self.batch_size = 8
+  self.batch_size = 128
   torch.manualSeed(self.gen, 1337)
 
   -- input image dimensions
@@ -30,21 +30,25 @@ function dataLoader:__init(dir,labelf)
   self.datalist = {}
   self:genFileList()
 
+  self.transformer = self:generateTransformer()
+
   -- super sample underrepresented labels in datalist
-  self:balanceLabels()
+  -- alpha input is range [0,1] to weight balancing
+  if rebalance == nil then rebalance = 0 end
+  self:balanceLabels(rebalance)
 
   assert(#self.datalist >= 1,'no images found in folder')
 
   self.shuffle = torch.randperm(self.gen,#self.datalist)
   self.shuffle_state = 1
 
-  self.numBatches = self.batch_size % self.shuffle:size(1)
+  self.numBatches = torch.floor(self.shuffle:size(1) / self.batch_size)
 
   collectgarbage()
 
 end
 
-function dataLoader:balanceLabels()
+function dataLoader:balanceLabels(alpha)
   local labelCounts = {}
   local labelSplits = {}
   for n=1,5 do
@@ -63,7 +67,7 @@ function dataLoader:balanceLabels()
   -- for each label, if below max represented:
   -- add a random sample from label class to bottom of datalist
   for label,count in pairs(labelCounts) do
-    for n=1,(maxRep - count) do
+    for n=1,torch.ceil((maxRep - count)*alpha) do
       local randSel = torch.ceil(torch.rand(1)*count)[1]
       local randPick = labelSplits[label][randSel]
       table.insert(self.datalist,randPick)
@@ -120,6 +124,48 @@ function dataLoader:getBatchList(num, shuff)
   return batch_list
 end
 
+function dataLoader:generateTransformer()
+  -- generate a transform function based on some other stuff
+  -- normalize and add color jitter/ geometric transforms
+  local T = require('util.transform')
+  local transforms = {}
+  -- scale, centercrop, scale/zoom, rotate, randcrop, jitter, normalize, pca
+
+  -- to accomodate zooms 1/1.15 to 1.15
+  -- also want to have some random crop jitter of 20 pixels
+  -- zoom transform
+  transforms[1] = T.RandomScale(532,604)
+  -- rotate (still centered around circle)
+  transforms[2] = T.Rotation(360)
+  transforms[3] = T.CenterCrop(532)
+
+  transforms[4] = T.CenterCrop(512)
+
+  -- color jitter
+  local jitteropt = {}
+  jitteropt.brightness = 0.05
+  jitteropt.saturation = 0.05
+  jitteropt.contrast = 0.05
+  transforms[5] = T.ColorJitter(jitteropt)
+
+  -- normalize
+  local meanstd = {}
+  meanstd.mean = {108.64628601/255, 75.86886597/255, 54.34005737/255}
+  meanstd.std = {70.53946096/255, 51.71475228/255, 43.03428563/255}
+  transforms[6] = T.ColorNormalize(meanstd)
+
+  --pca
+  local alphastd = 0.05
+  local eigval = torch.Tensor({1.655, 0.485, 0.157})
+  local eigvec = torch.Tensor({{-0.56543481, 0.71983482, 0.40240142},
+    {-0.5989477, -0.02304967, -0.80036049},
+    {-0.56694071, -0.6935729, 0.44423429}})
+  transforms[7] = T.Lighting(alphastd, eigval, eigvec)
+
+  local totalTransform = T.Compose(transforms)
+  return totalTransform
+end
+
 function dataLoader:getBatch(num,shuff)
   collectgarbage()
   -- first load in file names
@@ -134,34 +180,7 @@ function dataLoader:getBatch(num,shuff)
     local tmp_input = image.load(self.dataDir..'/'..fname..'.png')
     -- transform it to fit, center crop, rotate (, then color, etc)
     -- find the smallest side
-    local s_size = tmp_input:size(2)
-    local s_side = 2
-    if tmp_input:size(3) < s_size then
-      s_side = 3
-      s_size = tmp_input:size(3)
-    end
-
-    if (not (s_size == 512)) then
-      -- scale to 512
-      local sfactor = 512/s_size
-      tmp_input = image.scale(tmp_input,'*'..tostring(sfactor))
-      -- center crop
-      if s_side == 2 then
-        local l_y = torch.round(tmp_input:size(3)/2)-256
-        input[i] = image.crop(tmp_input,0,l_y,512,l_y+512)
-      else
-        local l_y = torch.round(tmp_input:size(2)/2)-256
-        input[i] = image.crop(tmp_input,l_y,0,l_y+512,512)
-      end
-    -- load the labels (integer...tranformed to softmax loss)
-    else
-      input[i] = tmp_input
-    end
-    -- rand rotate
-    local randRad = ((torch.rand(1)-0.5)*0.15)[1] -- 8.5 degrees
-    input[i] = image.rotate(input[i],randRad)
-
-    -- add normalization?
+    input[i] = self.transformer(tmp_input)
   end
   return input,labels
 end
