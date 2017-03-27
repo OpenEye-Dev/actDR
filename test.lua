@@ -267,7 +267,7 @@ local function test()
     testitnum = testitnum + 1
 
     local batchOutStd = batchAccumulator:std(2):mean()
-    local output_detail = torch.Tensor(64,3)
+    local output_detail = torch.Tensor(opt.batch_size,3)
     output_detail[{{},1}] = batchAccumulator:std(2):squeeze():float()
     output_detail[{{},2}] = avg_outputs:squeeze():float()
     output_detail[{{},3}] = currLabels:squeeze():float()
