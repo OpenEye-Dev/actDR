@@ -1,4 +1,4 @@
--- Author: Tristan Swedish - 2016
+-- Author: Tristan Swedish - 2017
 
 require 'torch'
 require 'cutorch'
@@ -167,7 +167,7 @@ local function getConfusionMatrix(outputs,labels)
 end
 
 local function calcKappa(confusion_matrix)
-  local O = confusion_matrix
+  local O = torch.Tensor(5,5):copy(confusion_matrix)
   local E = torch.Tensor(5,5):zero()
   -- quadratic distance weight matrix
   local w = torch.Tensor({
